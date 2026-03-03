@@ -160,6 +160,14 @@ DUMMY_STORAGE
   echo "Successfully patched dummy_sockaddr_storage in $SERVER_RS"
 fi
 
+# Patch udp_fallback/decode.rs for Windows (libc::sockaddr_storage not available on Windows)
+UDP_DECODE_RS="crates/slipstream-server/src/udp_fallback/decode.rs"
+if [ -f "$UDP_DECODE_RS" ]; then
+  echo "Patching $UDP_DECODE_RS to use SockaddrStorage from slipstream_ffi..."
+  sed -i 's/libc::sockaddr_storage/slipstream_ffi::SockaddrStorage/g' "$UDP_DECODE_RS"
+  echo "Successfully patched $UDP_DECODE_RS"
+fi
+
 # Patch udp_fallback.rs for Windows socket types
 UDP_FALLBACK_RS="crates/slipstream-server/src/udp_fallback.rs"
 if [ -f "$UDP_FALLBACK_RS" ]; then
