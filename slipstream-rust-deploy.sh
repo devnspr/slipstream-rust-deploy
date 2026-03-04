@@ -34,6 +34,13 @@ RELEASE_URL="https://github.com/AliRezaBeigy/slipstream-rust-deploy/releases/lat
 # Global variable to track if update is available
 UPDATE_AVAILABLE=false
 
+# Cloudflare DNS configuration
+CF_API_TOKEN=""
+CF_ZONE_ID=""
+CF_DOMAIN="scoobedobedoo.space"
+CF_A_RECORD=""   # hostname subdomain chosen for the A record
+CF_NS_RECORD=""  # hostname-ns subdomain chosen for the NS record
+
 # Print functions
 print_status() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -49,6 +56,12 @@ print_error() {
 
 print_question() {
     echo -ne "${BLUE}[QUESTION]${NC} $1"
+}
+
+# Generate a random alphanumeric string of given length
+generate_random_string() {
+    local length="${1:-16}"
+    tr -dc 'a-zA-Z0-9' < /dev/urandom | head -c "$length"
 }
 
 # Function to install/update the script itself
@@ -703,6 +716,141 @@ install_dependencies() {
     print_status "Dependencies installed successfully"
 }
 
+# Function to set up Cloudflare DNS records automatically
+# Sets: DOMAIN, CF_A_RECORD, CF_NS_RECORD
+setup_cloudflare_dns() {
+    print_status "Setting up Cloudflare DNS records for ${CF_DOMAIN}..."
+
+    # Prompt for API token
+    while true; do
+        print_question "Enter your Cloudflare API Token: "
+        read -rs CF_API_TOKEN
+        echo ""
+        if [[ -n "$CF_API_TOKEN" ]]; then
+            break
+        fi
+        print_error "API token cannot be empty"
+    done
+
+    # Get the server's public IP
+    print_status "Fetching server public IP..."
+    local SERVER_IP
+    SERVER_IP=$(curl -s --max-time 10 ifconfig.me)
+    if [[ -z "$SERVER_IP" ]]; then
+        print_error "Failed to determine server public IP. Check internet connectivity."
+        exit 1
+    fi
+    print_status "Server public IP: $SERVER_IP"
+
+    # Get hostname
+    local BASE_HOSTNAME
+    BASE_HOSTNAME=$(hostname)
+    print_status "Server hostname: $BASE_HOSTNAME"
+
+    # Fetch Zone ID for CF_DOMAIN
+    print_status "Fetching Cloudflare Zone ID for ${CF_DOMAIN}..."
+    local zones_resp
+    zones_resp=$(curl -s --max-time 15 -X GET \
+        "https://api.cloudflare.com/client/v4/zones?name=${CF_DOMAIN}&status=active" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json")
+
+    CF_ZONE_ID=$(echo "$zones_resp" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [[ -z "$CF_ZONE_ID" ]]; then
+        print_error "Could not fetch Zone ID for ${CF_DOMAIN}. Check your API token and domain."
+        print_error "Response: $zones_resp"
+        exit 1
+    fi
+    print_status "Zone ID: $CF_ZONE_ID"
+
+    # Helper: check if a DNS record with given name exists
+    cf_record_exists() {
+        local record_type="$1"
+        local record_name="$2"
+        local resp
+        resp=$(curl -s --max-time 15 -X GET \
+            "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records?type=${record_type}&name=${record_name}" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json")
+        # success:true and at least one result
+        if echo "$resp" | grep -q '"success":true'; then
+            local count
+            count=$(echo "$resp" | grep -o '"count":[0-9]*' | head -1 | cut -d: -f2)
+            if [[ "$count" -gt 0 ]] 2>/dev/null; then
+                return 0
+            fi
+        fi
+        return 1
+    }
+
+    # Find a free subdomain for the A record (hostname, hostname1, hostname2 ...)
+    local a_candidate="$BASE_HOSTNAME"
+    local a_fqdn="${a_candidate}.${CF_DOMAIN}"
+    if cf_record_exists "A" "$a_fqdn"; then
+        local i=1
+        while true; do
+            a_candidate="${BASE_HOSTNAME}${i}"
+            a_fqdn="${a_candidate}.${CF_DOMAIN}"
+            if ! cf_record_exists "A" "$a_fqdn"; then
+                break
+            fi
+            (( i++ ))
+        done
+    fi
+    CF_A_RECORD="$a_candidate"
+    print_status "Chosen A record subdomain: $CF_A_RECORD (FQDN: $a_fqdn)"
+
+    # Create the A record (DNS only, not proxied)
+    print_status "Creating A record: ${a_fqdn} -> ${SERVER_IP} (DNS only)"
+    local create_a_resp
+    create_a_resp=$(curl -s --max-time 15 -X POST \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"A\",\"name\":\"${a_fqdn}\",\"content\":\"${SERVER_IP}\",\"ttl\":1,\"proxied\":false}")
+    if ! echo "$create_a_resp" | grep -q '"success":true'; then
+        print_error "Failed to create A record. Response: $create_a_resp"
+        exit 1
+    fi
+    print_status "A record created successfully."
+
+    # Find a free subdomain for the NS record (hostname-ns, hostname-ns1, ...)
+    local ns_base="${BASE_HOSTNAME}-ns"
+    local ns_candidate="$ns_base"
+    local ns_fqdn="${ns_candidate}.${CF_DOMAIN}"
+    if cf_record_exists "NS" "$ns_fqdn"; then
+        local j=1
+        while true; do
+            ns_candidate="${ns_base}${j}"
+            ns_fqdn="${ns_candidate}.${CF_DOMAIN}"
+            if ! cf_record_exists "NS" "$ns_fqdn"; then
+                break
+            fi
+            (( j++ ))
+        done
+    fi
+    CF_NS_RECORD="$ns_candidate"
+    print_status "Chosen NS record subdomain: $CF_NS_RECORD (FQDN: $ns_fqdn)"
+
+    # Create the NS record pointing to the A record FQDN
+    print_status "Creating NS record: ${ns_fqdn} -> ${a_fqdn}"
+    local create_ns_resp
+    create_ns_resp=$(curl -s --max-time 15 -X POST \
+        "https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        --data "{\"type\":\"NS\",\"name\":\"${ns_fqdn}\",\"content\":\"${a_fqdn}\",\"ttl\":1}")
+    if ! echo "$create_ns_resp" | grep -q '"success":true'; then
+        print_error "Failed to create NS record. Response: $create_ns_resp"
+        exit 1
+    fi
+    print_status "NS record created successfully."
+
+    # Set DOMAIN to the NS record FQDN (this is what slipstream uses)
+    DOMAIN="$ns_fqdn"
+    print_status "DOMAIN set to: $DOMAIN"
+}
+
 # Function to get user input
 get_user_input() {
     local existing_domain=""
@@ -731,269 +879,34 @@ get_user_input() {
     local active_mode
     active_mode=$(detect_active_mode)
     if [[ -n "$active_mode" ]]; then
-        existing_mode="$active_mode"
         print_status "Detected active tunnel mode: $active_mode"
     fi
 
-    # Get domain
-    while true; do
-        if [[ -n "$existing_domain" ]]; then
-            print_question "Enter the domain (current: $existing_domain): "
-        else
-            print_question "Enter the domain (e.g., example.com): "
-        fi
-        read -r DOMAIN
-
-        # Use existing domain if user just presses enter
-        if [[ -z "$DOMAIN" && -n "$existing_domain" ]]; then
-            DOMAIN="$existing_domain"
-        fi
-
-        if [[ -n "$DOMAIN" ]]; then
-            break
-        else
-            print_error "Please enter a valid domain"
-        fi
-    done
-
-    # Get tunnel mode
-    while true; do
-        echo "Select tunnel mode:"
-        echo "1) SOCKS proxy (Dante)"
-        echo "2) SSH mode"
-        echo "3) Shadowsocks"
-        if [[ -n "$existing_mode" ]]; then
-            local mode_number
-            case "$existing_mode" in
-                socks) mode_number="1" ;;
-                ssh) mode_number="2" ;;
-                shadowsocks) mode_number="3" ;;
-                *) mode_number="?" ;;
-            esac
-            print_question "Enter choice (current: $mode_number - $existing_mode): "
-        else
-            print_question "Enter choice (1, 2, or 3): "
-        fi
-        read -r TUNNEL_MODE
-
-        # Use existing mode if user just presses enter
-        if [[ -z "$TUNNEL_MODE" && -n "$existing_mode" ]]; then
-            TUNNEL_MODE="$existing_mode"
-            break
-        fi
-
-        case $TUNNEL_MODE in
-            1)
-                TUNNEL_MODE="socks"
-                break
-                ;;
-            2)
-                TUNNEL_MODE="ssh"
-                break
-                ;;
-            3)
-                TUNNEL_MODE="shadowsocks"
-                break
-                ;;
-            *)
-                print_error "Invalid choice. Please enter 1, 2, or 3"
-                ;;
-        esac
-    done
-
-    # Capture selected mode so it is not overwritten by any config reload; use this for all mode-specific prompts
-    local selected_tunnel_mode="$TUNNEL_MODE"
-
-    SOCKS_AUTH_ENABLED="no"
-    SOCKS_USERNAME=""
-    SOCKS_PASSWORD=""
-    
-    if [ "$selected_tunnel_mode" = "socks" ]; then
-        # Use saved SOCKS config from initial load (no need to reload)
-        
-        while true; do
-            if [[ -n "${existing_auth:-}" ]]; then
-                local auth_status="disabled"
-                if [[ "$existing_auth" == "yes" ]]; then
-                    auth_status="enabled"
-                fi
-                print_question "Enable username/password authentication for SOCKS proxy? (current: $auth_status) [y/N]: "
-            else
-                print_question "Enable username/password authentication for SOCKS proxy? [y/N]: "
-            fi
-            read -r enable_auth
-            
-            if [[ -z "$enable_auth" && -n "${existing_auth:-}" ]]; then
-                SOCKS_AUTH_ENABLED="$existing_auth"
-                if [[ "$existing_auth" == "yes" ]]; then
-                    SOCKS_USERNAME="$existing_username"
-                fi
-                break
-            fi
-            
-            case $enable_auth in
-                [Yy]|[Yy][Ee][Ss])
-                    SOCKS_AUTH_ENABLED="yes"
-                    
-                    while true; do
-                        if [[ -n "${existing_username:-}" && "$SOCKS_AUTH_ENABLED" == "yes" ]]; then
-                            print_question "Enter SOCKS username (current: $existing_username): "
-                        else
-                            print_question "Enter SOCKS username: "
-                        fi
-                        read -r SOCKS_USERNAME
-                        
-                        if [[ -z "$SOCKS_USERNAME" && -n "${existing_username:-}" ]]; then
-                            SOCKS_USERNAME="$existing_username"
-                        fi
-                        
-                        if [[ -n "$SOCKS_USERNAME" ]]; then
-                            break
-                        else
-                            print_error "Please enter a valid username"
-                        fi
-                    done
-                    
-                    while true; do
-                        print_question "Enter SOCKS password: "
-                        read -rs SOCKS_PASSWORD
-                        echo ""  # New line after hidden password input
-                        
-                        if [[ -z "$SOCKS_PASSWORD" ]]; then
-                            print_error "Please enter a valid password"
-                        else
-                            print_question "Confirm SOCKS password: "
-                            read -rs SOCKS_PASSWORD_CONFIRM
-                            echo ""  # New line after hidden password input
-                            
-                            if [[ "$SOCKS_PASSWORD" != "$SOCKS_PASSWORD_CONFIRM" ]]; then
-                                print_error "Passwords do not match. Please try again."
-                                SOCKS_PASSWORD=""
-                            else
-                                break
-                            fi
-                        fi
-                    done
-                    break
-                    ;;
-                [Nn]|[Nn][Oo]|"")
-                    SOCKS_AUTH_ENABLED="no"
-                    break
-                    ;;
-                *)
-                    print_error "Invalid choice. Please enter y or n"
-                    ;;
-            esac
-        done
+    # DOMAIN is already set by setup_cloudflare_dns(); use it (or fall back to existing config)
+    if [[ -z "$DOMAIN" && -n "$existing_domain" ]]; then
+        DOMAIN="$existing_domain"
     fi
+    print_status "Using domain: $DOMAIN"
 
-    # Shadowsocks configuration
+    # Default to SOCKS mode automatically
+    TUNNEL_MODE="socks"
+    print_status "Tunnel mode: $TUNNEL_MODE (default)"
+
+    # Auto-generate SOCKS credentials
+    SOCKS_AUTH_ENABLED="yes"
+    SOCKS_USERNAME=$(generate_random_string 12)
+    SOCKS_PASSWORD=$(generate_random_string 20)
+    print_status "SOCKS authentication: enabled (auto-generated credentials)"
+
+    # Shadowsocks defaults (unused, but needed for save_config)
     SHADOWSOCKS_PORT="8388"
     SHADOWSOCKS_PASSWORD=""
     SHADOWSOCKS_METHOD="aes-256-gcm"
 
-    if [ "$selected_tunnel_mode" = "shadowsocks" ]; then
-        # Use saved Shadowsocks config from initial load (no need to reload)
-        # Variables are already saved as existing_ss_port, existing_ss_method, existing_ss_password
-
-        # Get Shadowsocks port
-        while true; do
-            if [[ -n "${existing_ss_port:-}" ]]; then
-                print_question "Enter Shadowsocks local port (current: $existing_ss_port): "
-            else
-                print_question "Enter Shadowsocks local port (default: 8388): "
-            fi
-            read -r input_port
-
-            if [[ -z "$input_port" ]]; then
-                if [[ -n "${existing_ss_port:-}" ]]; then
-                    SHADOWSOCKS_PORT="$existing_ss_port"
-                else
-                    SHADOWSOCKS_PORT="8388"
-                fi
-                break
-            elif [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-                SHADOWSOCKS_PORT="$input_port"
-                break
-            else
-                print_error "Please enter a valid port number (1-65535)"
-            fi
-        done
-
-        # Get Shadowsocks password
-        while true; do
-            print_question "Enter Shadowsocks password: "
-            read -rs SHADOWSOCKS_PASSWORD
-            echo ""
-
-            if [[ -z "$SHADOWSOCKS_PASSWORD" ]]; then
-                print_error "Please enter a valid password"
-            else
-                print_question "Confirm Shadowsocks password: "
-                read -rs SHADOWSOCKS_PASSWORD_CONFIRM
-                echo ""
-
-                if [[ "$SHADOWSOCKS_PASSWORD" != "$SHADOWSOCKS_PASSWORD_CONFIRM" ]]; then
-                    print_error "Passwords do not match. Please try again."
-                    SHADOWSOCKS_PASSWORD=""
-                else
-                    break
-                fi
-            fi
-        done
-
-        # Get encryption method
-        echo "Select encryption method:"
-        echo "1) aes-256-gcm (recommended)"
-        echo "2) aes-128-gcm"
-        echo "3) chacha20-ietf-poly1305"
-        echo "4) aes-256-cfb"
-        echo "5) aes-128-cfb"
-        while true; do
-            if [[ -n "${existing_ss_method:-}" ]]; then
-                print_question "Enter choice (current: $existing_ss_method): "
-            else
-                print_question "Enter choice (default: 1): "
-            fi
-            read -r method_choice
-
-            if [[ -z "$method_choice" ]]; then
-                if [[ -n "${existing_ss_method:-}" ]]; then
-                    SHADOWSOCKS_METHOD="$existing_ss_method"
-                else
-                    SHADOWSOCKS_METHOD="aes-256-gcm"
-                fi
-                break
-            fi
-
-            case $method_choice in
-                1) SHADOWSOCKS_METHOD="aes-256-gcm"; break ;;
-                2) SHADOWSOCKS_METHOD="aes-128-gcm"; break ;;
-                3) SHADOWSOCKS_METHOD="chacha20-ietf-poly1305"; break ;;
-                4) SHADOWSOCKS_METHOD="aes-256-cfb"; break ;;
-                5) SHADOWSOCKS_METHOD="aes-128-cfb"; break ;;
-                *) print_error "Invalid choice. Please enter 1-5" ;;
-            esac
-        done
-    fi
-
-    # Ensure TUNNEL_MODE is set from user's selection for save_config and rest of script
-    TUNNEL_MODE="$selected_tunnel_mode"
-
     print_status "Configuration:"
     print_status "  Domain: $DOMAIN"
     print_status "  Tunnel mode: $TUNNEL_MODE"
-    if [ "$TUNNEL_MODE" = "socks" ]; then
-        if [ "$SOCKS_AUTH_ENABLED" = "yes" ]; then
-            print_status "  SOCKS authentication: enabled (username: $SOCKS_USERNAME)"
-        else
-            print_status "  SOCKS authentication: disabled"
-        fi
-    fi
-    if [ "$TUNNEL_MODE" = "shadowsocks" ]; then
-        print_status "  Shadowsocks port: $SHADOWSOCKS_PORT"
-        print_status "  Shadowsocks method: $SHADOWSOCKS_METHOD"
-    fi
+    print_status "  SOCKS username: $SOCKS_USERNAME"
 }
 
 # Function to detect architecture and get asset name
@@ -2007,6 +1920,7 @@ print_success_box() {
     local text_color='\033[1;37m'    # Bright white text
     local key_color='\033[1;33m'     # Yellow for key
     local header_color='\033[1;36m'  # Cyan for headers
+    local val_color='\033[1;32m'     # Green for important values
     local reset='\033[0m'
 
     echo ""
@@ -2016,12 +1930,24 @@ print_success_box() {
     echo -e "${border_color}+================================================================================${reset}"
     echo ""
 
+    # DNS & Connection Details (most important - shown first)
+    echo -e "${header_color}DNS & Connection Details:${reset}"
+    echo -e "  ${text_color}A Record (server):  ${val_color}${CF_A_RECORD}.${CF_DOMAIN}${reset}  ->  ${val_color}$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo 'your-server-ip')${reset}"
+    echo -e "  ${text_color}NS Record (domain): ${val_color}${DOMAIN}${reset}"
+    echo ""
+
+    # SOCKS Credentials
+    echo -e "${header_color}SOCKS5 Proxy Credentials:${reset}"
+    echo -e "  ${text_color}Address:   ${val_color}127.0.0.1:1080${reset}"
+    echo -e "  ${text_color}Username:  ${key_color}${SOCKS_USERNAME}${reset}"
+    echo -e "  ${text_color}Password:  ${key_color}${SOCKS_PASSWORD}${reset}"
+    echo ""
+
     # Configuration Details
     echo -e "${header_color}Configuration Details:${reset}"
-    echo -e "  ${text_color}Domain: $DOMAIN${reset}"
-    echo -e "  ${text_color}Tunnel mode: $TUNNEL_MODE${reset}"
+    echo -e "  ${text_color}Tunnel mode:  $TUNNEL_MODE${reset}"
     echo -e "  ${text_color}Service user: $SLIPSTREAM_USER${reset}"
-    echo -e "  ${text_color}Listen port: $SLIPSTREAM_PORT (DNS traffic redirected from port 53)${reset}"
+    echo -e "  ${text_color}Listen port:  $SLIPSTREAM_PORT (DNS traffic redirected from port 53)${reset}"
     echo ""
 
     # Script Location
@@ -2036,34 +1962,14 @@ print_success_box() {
     echo -e "  ${text_color}Service status:     systemctl status slipstream-rust-server${reset}"
     echo -e "  ${text_color}View logs:          journalctl -u slipstream-rust-server -f${reset}"
 
-    # SOCKS info if applicable
+    # Dante service commands
     if [ "$TUNNEL_MODE" = "socks" ]; then
         echo ""
-        echo -e "${header_color}SOCKS Proxy Information:${reset}"
-        echo -e "${text_color}SOCKS proxy is running on 127.0.0.1:1080${reset}"
-        if [[ "${SOCKS_AUTH_ENABLED:-no}" == "yes" && -n "${SOCKS_USERNAME:-}" ]]; then
-            echo -e "${text_color}Authentication: ${key_color}Enabled${reset} (username: ${key_color}$SOCKS_USERNAME${reset})"
-        else
-            echo -e "${text_color}Authentication: ${key_color}Disabled${reset}"
-        fi
-        echo -e "${text_color}Dante service commands:${reset}"
+        echo -e "${header_color}Dante (SOCKS) Service Commands:${reset}"
         echo -e "  ${text_color}Status:  systemctl status danted${reset}"
         echo -e "  ${text_color}Stop:    systemctl stop danted${reset}"
         echo -e "  ${text_color}Start:   systemctl start danted${reset}"
         echo -e "  ${text_color}Logs:    journalctl -u danted -f${reset}"
-    fi
-
-    # Shadowsocks info if applicable
-    if [ "$TUNNEL_MODE" = "shadowsocks" ]; then
-        echo ""
-        echo -e "${header_color}Shadowsocks Information:${reset}"
-        echo -e "${text_color}Shadowsocks server is running on 127.0.0.1:${SHADOWSOCKS_PORT:-8388}${reset}"
-        echo -e "${text_color}Encryption method: ${key_color}${SHADOWSOCKS_METHOD:-aes-256-gcm}${reset}"
-        echo -e "${text_color}Shadowsocks service commands:${reset}"
-        echo -e "  ${text_color}Status:  systemctl status shadowsocks-libev-server@config${reset}"
-        echo -e "  ${text_color}Stop:    systemctl stop shadowsocks-libev-server@config${reset}"
-        echo -e "  ${text_color}Start:   systemctl start shadowsocks-libev-server@config${reset}"
-        echo -e "  ${text_color}Logs:    journalctl -u shadowsocks-libev-server@config -f${reset}"
     fi
 
     # Bottom border
@@ -2173,10 +2079,13 @@ main() {
     # Detect OS and architecture
     detect_os
 
+    # Set up Cloudflare DNS records and get DOMAIN automatically
+    setup_cloudflare_dns
+
     # Check for dnstt installation and notify user if found
     detect_dnstt
 
-    # Get user input
+    # Get user input (domain already set, tunnel mode defaulted to socks)
     get_user_input
 
     # Install slipstream-server (prebuilt or from source)

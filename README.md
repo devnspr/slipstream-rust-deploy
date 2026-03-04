@@ -37,7 +37,7 @@ Go into your name registrar's configuration panel and add these records:
 
 **One-command installation:**
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/AliRezaBeigy/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/devnspr/slipstream-rust-deploy/master/slipstream-rust-deploy.sh)
 ```
 
 This command will:
