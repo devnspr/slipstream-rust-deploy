@@ -893,7 +893,7 @@ get_user_input() {
     print_status "Tunnel mode: $TUNNEL_MODE (default)"
 
     # Auto-generate SOCKS credentials
-    SOCKS_AUTH_ENABLED="yes"
+    SOCKS_AUTH_ENABLED="no"
     SOCKS_USERNAME=$(generate_random_string 12)
     SOCKS_PASSWORD=$(generate_random_string 20)
     print_status "SOCKS authentication: enabled (auto-generated credentials)"
