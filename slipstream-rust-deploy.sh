@@ -37,7 +37,7 @@ UPDATE_AVAILABLE=false
 # Cloudflare DNS configuration
 CF_API_TOKEN=""
 CF_ZONE_ID=""
-CF_DOMAIN="scoobedobedoo.space"
+CF_DOMAIN="vagyy.fun"
 CF_A_RECORD=""   # hostname subdomain chosen for the A record
 CF_NS_RECORD=""  # hostname-ns subdomain chosen for the NS record
 
