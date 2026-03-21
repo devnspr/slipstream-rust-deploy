@@ -742,11 +742,6 @@ setup_cloudflare_dns() {
     fi
     print_status "Server public IP: $SERVER_IP"
 
-    # Get hostname
-    local BASE_HOSTNAME
-    BASE_HOSTNAME=$(hostname)
-    print_status "Server hostname: $BASE_HOSTNAME"
-
     # Fetch Zone ID for CF_DOMAIN
     print_status "Fetching Cloudflare Zone ID for ${CF_DOMAIN}..."
     local zones_resp
@@ -783,20 +778,32 @@ setup_cloudflare_dns() {
         return 1
     }
 
-    # Find a free subdomain for the A record (hostname, hostname1, hostname2 ...)
-    local a_candidate="$BASE_HOSTNAME"
-    local a_fqdn="${a_candidate}.${CF_DOMAIN}"
-    if cf_record_exists "A" "$a_fqdn"; then
-        local i=1
-        while true; do
-            a_candidate="${BASE_HOSTNAME}${i}"
-            a_fqdn="${a_candidate}.${CF_DOMAIN}"
-            if ! cf_record_exists "A" "$a_fqdn"; then
-                break
+    # Helper: pick a random single lowercase letter (a-z) not already taken for a given record type
+    pick_random_char() {
+        local record_type="$1"
+        # Build a shuffled list of a-z
+        local letters
+        letters=$(echo {a..z} | tr ' ' '\n' | shuf)
+        for letter in $letters; do
+            local fqdn="${letter}.${CF_DOMAIN}"
+            if ! cf_record_exists "$record_type" "$fqdn"; then
+                echo "$letter"
+                return 0
             fi
-            (( i++ ))
         done
+        # All 26 letters taken
+        echo ""
+        return 1
+    }
+
+    # Find a free single-char subdomain for the A record
+    local a_candidate
+    a_candidate=$(pick_random_char "A")
+    if [[ -z "$a_candidate" ]]; then
+        print_error "All single-character A record subdomains (a-z) are taken on ${CF_DOMAIN}."
+        exit 1
     fi
+    local a_fqdn="${a_candidate}.${CF_DOMAIN}"
     CF_A_RECORD="$a_candidate"
     print_status "Chosen A record subdomain: $CF_A_RECORD (FQDN: $a_fqdn)"
 
@@ -814,21 +821,14 @@ setup_cloudflare_dns() {
     fi
     print_status "A record created successfully."
 
-    # Find a free subdomain for the NS record (hostname-ns, hostname-ns1, ...)
-    local ns_base="${BASE_HOSTNAME}-ns"
-    local ns_candidate="$ns_base"
-    local ns_fqdn="${ns_candidate}.${CF_DOMAIN}"
-    if cf_record_exists "NS" "$ns_fqdn"; then
-        local j=1
-        while true; do
-            ns_candidate="${ns_base}${j}"
-            ns_fqdn="${ns_candidate}.${CF_DOMAIN}"
-            if ! cf_record_exists "NS" "$ns_fqdn"; then
-                break
-            fi
-            (( j++ ))
-        done
+    # Find a free single-char subdomain for the NS record
+    local ns_candidate
+    ns_candidate=$(pick_random_char "NS")
+    if [[ -z "$ns_candidate" ]]; then
+        print_error "All single-character NS record subdomains (a-z) are taken on ${CF_DOMAIN}."
+        exit 1
     fi
+    local ns_fqdn="${ns_candidate}.${CF_DOMAIN}"
     CF_NS_RECORD="$ns_candidate"
     print_status "Chosen NS record subdomain: $CF_NS_RECORD (FQDN: $ns_fqdn)"
 
