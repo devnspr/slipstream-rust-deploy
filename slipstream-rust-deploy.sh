@@ -735,7 +735,7 @@ setup_cloudflare_dns() {
     # Get the server's public IP
     print_status "Fetching server public IP..."
     local SERVER_IP
-    SERVER_IP=$(curl -s --max-time 10 ifconfig.me || curl -s --max-time 10 icanhazip.com)
+    SERVER_IP=$(curl -s --max-time 10 icanhazip.com)
     if [[ -z "$SERVER_IP" ]]; then
         print_error "Failed to determine server public IP. Check internet connectivity."
         exit 1
@@ -1932,7 +1932,7 @@ print_success_box() {
 
     # DNS & Connection Details (most important - shown first)
     echo -e "${header_color}DNS & Connection Details:${reset}"
-    echo -e "  ${text_color}A Record (server):  ${val_color}${CF_A_RECORD}.${CF_DOMAIN}${reset}  ->  ${val_color}$(curl -s --max-time 5 ifconfig.me 2>/dev/null || curl -s --max-time 5 icanhazip.com 2>/dev/null || echo 'your-server-ip')${reset}"
+    echo -e "  ${text_color}A Record (server):  ${val_color}${CF_A_RECORD}.${CF_DOMAIN}${reset}  ->  ${val_color}$(curl -s --max-time 5 icanhazip.com 2>/dev/null || echo 'your-server-ip')${reset}"
     echo -e "  ${text_color}NS Record (domain): ${val_color}${DOMAIN}${reset}"
     echo ""
 
